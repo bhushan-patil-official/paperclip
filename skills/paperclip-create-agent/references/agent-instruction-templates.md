@@ -20,6 +20,7 @@ In the hire comment, state which path you took so the board can audit the reason
 | Template | Use when hiring | Typical adapter | Lens density |
 |---|---|---|---|
 | [`Coder`](agents/coder.md) | Software engineers who implement code, debug issues, write tests, and coordinate with QA/CTO | `codex_local`, `claude_local`, `cursor`, or another coding adapter | Low (operational) |
+| [`CTO`](agents/cto.md) | Chief Technology Officers who own technical vision, architecture, engineering execution, staffing, and cross-functional coordination | `claude_local`, `codex_local`, `cursor`, or another adapter with repo and planning context | High (lens-heavy) |
 | [`QA`](agents/qa.md) | QA engineers who reproduce bugs, validate fixes, capture screenshots, and report actionable findings | `claude_local` or another browser-capable adapter | Low (operational) |
 | [`UX Designer`](agents/uxdesigner.md) | Product designers who produce UX specs, review interface quality, and evolve the design system | `codex_local`, `claude_local`, or another adapter with repo/design context | High (lens-heavy) |
 | [`SecurityEngineer`](agents/securityengineer.md) | Security engineers who threat-model, review auth/crypto/input handling, triage supply-chain and LLM-agent risk, and drive remediations | `claude_local`, `codex_local`, or another adapter with repo context | High (lens-heavy) |
@@ -29,13 +30,14 @@ If you are hiring a role that is not in this index, do not force a fit. Use the 
 ### When to use each template
 
 - **Coder** — the hire primarily writes or edits code against existing conventions, runs focused tests, and hands off to QA. Pick Coder when the charter is "ship code that passes review and CI." Avoid for pure strategy, design, or security review.
+- **CTO** — the hire owns technical vision, architecture, and engineering execution end-to-end. Pick CTO when the role must make architecture calls, delegate to engineers, assess risk on three axes, and escalate product or business decisions to the CEO. Avoid for agents that only implement assigned code — that belongs with a Coder.
 - **QA** — the hire reproduces bugs in a running product, exercises flows in a browser or test harness, and produces evidence-grounded pass/fail reports. Pick QA when the charter is "confirm the user experience matches intent." Avoid for agents that only run static linters or unit tests — that belongs with a Coder.
 - **UX Designer** — the hire is accountable for the user experience and visual quality of product work. Pick UXDesigner when the role must make design calls, push back on unstyled implementations, and evolve the design system. Avoid for agents that only proofread or enforce style-guide consistency without making IA or voice decisions, or that only run automated accessibility scans — those are operational and can use the baseline guide. Content Design proper (microcopy, voice, IA) is a lens-using variant; see the adjacent-template path.
 - **SecurityEngineer** — the hire is accountable for security posture: threat-modeling, reviewing auth/crypto/input handling, supply-chain and LLM-agent risk, and driving remediations with evidence. Pick SecurityEngineer when the role must block insecure designs, propose concrete fixes, and handle sensitive disclosure. Avoid for agents that only run automated scanners with no triage responsibility — those are operational and can use the baseline guide with a short security-lens subset.
 
 ### Lens density: when to keep the full lens list
 
-- **Lens-heavy templates** (UXDesigner, SecurityEngineer) encode expert judgment. The long lens list is the deliverable — keep it intact when hiring the primary domain owner. Drop lens groups only when the hire has an explicitly narrower scope (for example, an "Application Security Reviewer" who will never touch infrastructure or cryptography).
+- **Lens-heavy templates** (CTO, UXDesigner, SecurityEngineer) encode expert judgment. The long lens list is the deliverable — keep it intact when hiring the primary domain owner. Drop lens groups only when the hire has an explicitly narrower scope (for example, an "Application Security Reviewer" who will never touch infrastructure or cryptography).
 - **Operational templates** (Coder, QA) stay short on purpose. Do not paste lens lists into them just because the baseline guide recommends lenses. If a Coder-adjacent role genuinely needs lenses (for example, a Performance Engineer), pull a focused 5–10 lens set from the baseline-role-guide examples, not the full SecurityEngineer or UXDesigner set.
 
 ## How to apply an exact template
