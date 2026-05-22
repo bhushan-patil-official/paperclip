@@ -68,6 +68,30 @@ export const modelProfiles: AdapterModelProfileDefinition[] = [
     },
     source: "adapter_default",
   },
+  {
+    key: "simple",
+    label: "Simple",
+    adapterConfig: { model: "gpt-5.1-codex-mini" },
+    source: "adapter_default",
+  },
+  {
+    key: "standard",
+    label: "Standard",
+    adapterConfig: { model: DEFAULT_CURSOR_LOCAL_MODEL },
+    source: "adapter_default",
+  },
+  {
+    key: "advanced",
+    label: "Advanced",
+    adapterConfig: { model: "gpt-5.4" },
+    source: "adapter_default",
+  },
+  {
+    key: "expert",
+    label: "Expert",
+    adapterConfig: { model: "gpt-5.4" },
+    source: "adapter_default",
+  },
 ];
 
 export const agentConfigurationDoc = `# cursor agent configuration

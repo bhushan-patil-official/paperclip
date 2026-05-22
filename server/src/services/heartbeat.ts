@@ -286,7 +286,9 @@ function readTransientRetryNotBeforeFromRun(run: Pick<typeof heartbeatRuns.$infe
 function readTransientRecoveryContractFromRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
-  return readHeartbeatRunErrorFamily(run) === "transient_upstream"
+  const errorFamily = readHeartbeatRunErrorFamily(run);
+  if (errorFamily === "rate_limited") return null;
+  return errorFamily === "transient_upstream"
     ? {
         errorFamily: "transient_upstream" as const,
         retryNotBefore: readTransientRetryNotBeforeFromRun(run),
@@ -1046,7 +1048,7 @@ interface ParsedIssueAssigneeAdapterOverrides {
   useProjectWorkspace: boolean | null;
 }
 
-type ModelProfileRequestSource = "issue_override" | "wake_context";
+type ModelProfileRequestSource = "issue_override" | "wake_context" | "issue_priority";
 type AppliedModelProfileConfigSource = "agent_runtime" | "adapter_default";
 
 export interface ModelProfileApplication {
@@ -1132,21 +1134,44 @@ function readAgentRuntimeModelProfile(
   };
 }
 
+export function resolveModelTierFromIssuePriority(
+  issuePriority: string | null | undefined,
+  agentRuntimeConfig: unknown,
+): ModelProfileKey | null {
+  const runtimeConfig = parseObject(agentRuntimeConfig);
+  const tierRules = parseObject(runtimeConfig.modelTierRules);
+  if (Object.keys(tierRules).length === 0) return null;
+
+  const priorityMap = parseObject(tierRules.priority);
+  const normalizedPriority = typeof issuePriority === "string" ? issuePriority.trim() : "";
+  if (normalizedPriority && priorityMap[normalizedPriority] !== undefined) {
+    return readModelProfileKey(priorityMap[normalizedPriority]);
+  }
+
+  return readModelProfileKey(tierRules.default);
+}
+
 export function resolveModelProfileApplication(input: {
   adapterModelProfiles: AdapterModelProfileDefinition[];
   agentRuntimeConfig: unknown;
   issueModelProfile: ModelProfileKey | null | undefined;
+  issuePriority?: string | null;
   contextSnapshot: Record<string, unknown> | null | undefined;
   profileResolutionFallbackReason?: string | null;
 }): ModelProfileApplication {
   const issueModelProfile = input.issueModelProfile ?? null;
   const contextModelProfile = readContextModelProfile(input.contextSnapshot);
-  const requested = issueModelProfile ?? contextModelProfile;
+  const priorityTier = !issueModelProfile && !contextModelProfile
+    ? resolveModelTierFromIssuePriority(input.issuePriority, input.agentRuntimeConfig)
+    : null;
+  const requested = issueModelProfile ?? contextModelProfile ?? priorityTier;
   const requestedBy: ModelProfileRequestSource | null = issueModelProfile
     ? "issue_override"
     : contextModelProfile
       ? "wake_context"
-      : null;
+      : priorityTier
+        ? "issue_priority"
+        : null;
 
   if (!requested) {
     return {
@@ -7165,6 +7190,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       adapterModelProfiles,
       agentRuntimeConfig: agent.runtimeConfig,
       issueModelProfile: issueAssigneeOverrides?.modelProfile ?? null,
+      issuePriority: issueContext?.priority ?? null,
       contextSnapshot: context,
       profileResolutionFallbackReason,
     });

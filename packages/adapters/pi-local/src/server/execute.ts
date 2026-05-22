@@ -2,7 +2,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import {
+  executeWithOptionalModelChain,
+  inferOpenAiCompatibleBiller,
+  type AdapterExecutionContext,
+  type AdapterExecutionResult,
+  type ModelChainEntry,
+} from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
@@ -46,7 +52,7 @@ import {
   runChildProcess,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
-import { isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
+import { isPiRateLimited, isPiUnknownSessionError, parsePiJsonl } from "./parse.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
@@ -615,7 +621,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ];
   })();
 
-  const buildArgs = (sessionFile: string): string[] => {
+  const buildArgs = (
+    sessionFile: string,
+    attemptProvider: string | null,
+    attemptModelId: string | null,
+    attemptThinking: string,
+  ): string[] => {
     const args: string[] = [];
 
     // Use JSON mode for structured output with print mode (non-interactive)
@@ -625,9 +636,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Use --append-system-prompt to extend Pi's default system prompt
     args.push("--append-system-prompt", renderedSystemPromptExtension);
 
-    if (provider) args.push("--provider", provider);
-    if (modelId) args.push("--model", modelId);
-    if (thinking) args.push("--thinking", thinking);
+    if (attemptProvider) args.push("--provider", attemptProvider);
+    if (attemptModelId) args.push("--model", attemptModelId);
+    if (attemptThinking) args.push("--thinking", attemptThinking);
 
     args.push("--tools", "read,bash,edit,write,grep,find,ls");
     args.push("--session", sessionFile);
@@ -641,8 +652,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return args;
   };
 
-  const runAttempt = async (sessionFile: string) => {
-    const args = buildArgs(sessionFile);
+  const runAttempt = async (sessionFile: string, entry: ModelChainEntry) => {
+    const attemptProvider = parseModelProvider(entry.model);
+    const attemptModelId = parseModelId(entry.model);
+    const attemptThinking = asString(entry.variant, thinking);
+    const attemptEnv = entry.env
+      ? { ...(executionTargetIsRemote ? env : runtimeEnv), ...entry.env }
+      : (executionTargetIsRemote ? env : runtimeEnv);
+    const args = buildArgs(sessionFile, attemptProvider, attemptModelId, attemptThinking);
     if (onMeta) {
       await onMeta({
         adapterType: "pi_local",
@@ -682,7 +699,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       cwd,
-      env: executionTargetIsRemote ? env : runtimeEnv,
+      env: attemptEnv,
       timeoutSec,
       graceSec,
       onSpawn,
@@ -707,8 +724,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       rawStderr: string;
       parsed: ReturnType<typeof parsePiJsonl>;
     },
+    attemptModelIdValue: string,
     clearSessionOnMissingSession = false,
   ): AdapterExecutionResult => {
+    const attemptProvider = parseModelProvider(attemptModelIdValue);
     if (attempt.proc.timedOut) {
       return {
         exitCode: attempt.proc.exitCode,
@@ -740,12 +759,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const parsedError = attempt.parsed.errors.find((error) => error.trim().length > 0) ?? "";
     const effectiveExitCode = (rawExitCode ?? 0) === 0 && parsedError ? 1 : rawExitCode;
     const fallbackErrorMessage = parsedError || stderrLine || `Pi exited with code ${rawExitCode ?? -1}`;
+    const rateLimited = (effectiveExitCode ?? 0) !== 0
+      && isPiRateLimited(attempt.proc.stdout, attempt.proc.stderr, fallbackErrorMessage);
 
     return {
       exitCode: effectiveExitCode,
       signal: attempt.proc.signal,
       timedOut: false,
       errorMessage: (effectiveExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+      errorCode: rateLimited ? "pi_rate_limited" : null,
+      errorFamily: rateLimited ? "transient_upstream" : null,
       usage: {
         inputTokens: attempt.parsed.usage.inputTokens,
         outputTokens: attempt.parsed.usage.outputTokens,
@@ -754,9 +777,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,
-      provider: provider,
-      biller: resolvePiBiller(runtimeEnv, provider),
-      model: model,
+      provider: attemptProvider,
+      biller: resolvePiBiller(runtimeEnv, attemptProvider),
+      model: attemptModelIdValue,
       billingType: "unknown",
       costUsd: attempt.parsed.usage.costUsd,
       resultJson: {
@@ -768,12 +791,38 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
-  try {
-    const initial = await runAttempt(sessionPath);
+  const createFreshSessionPath = async () => {
+    const newSessionPath = executionTargetIsRemote && remoteRuntimeRootDir
+      ? buildRemoteSessionPath(remoteRuntimeRootDir, agent.id, new Date().toISOString())
+      : buildSessionPath(agent.id, new Date().toISOString());
+    if (executionTargetIsRemote) {
+      await ensureAdapterExecutionTargetFile(runId, executionTarget, newSessionPath, {
+        cwd,
+        env,
+        timeoutSec: 15,
+        graceSec: 5,
+        onLog,
+      });
+    } else {
+      try {
+        await fs.writeFile(newSessionPath, "", { flag: "wx" });
+      } catch (writeError) {
+        if ((writeError as NodeJS.ErrnoException).code !== "EEXIST") {
+          throw writeError;
+        }
+      }
+    }
+    return newSessionPath;
+  };
+
+  const runEntry = async (entry: ModelChainEntry, chainSessionPath: string | null): Promise<AdapterExecutionResult> => {
+    const sessionFile = chainSessionPath ?? await createFreshSessionPath();
+    const initial = await runAttempt(sessionFile, entry);
     const initialFailed =
       !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || initial.parsed.errors.length > 0);
 
     if (
+      chainSessionPath &&
       canResumeSession &&
       initialFailed &&
       isPiUnknownSessionError(initial.proc.stdout, initial.rawStderr)
@@ -782,31 +831,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         "stdout",
         `[paperclip] Pi session "${runtimeSessionId}" is unavailable; retrying with a fresh session.\n`,
       );
-      const newSessionPath = executionTargetIsRemote && remoteRuntimeRootDir
-        ? buildRemoteSessionPath(remoteRuntimeRootDir, agent.id, new Date().toISOString())
-        : buildSessionPath(agent.id, new Date().toISOString());
-      if (executionTargetIsRemote) {
-        await ensureAdapterExecutionTargetFile(runId, executionTarget, newSessionPath, {
-          cwd,
-          env,
-          timeoutSec: 15,
-          graceSec: 5,
-          onLog,
-        });
-      } else {
-        try {
-          await fs.writeFile(newSessionPath, "", { flag: "wx" });
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
-            throw err;
-          }
-        }
-      }
-      const retry = await runAttempt(newSessionPath);
-      return toResult(retry, true);
+      const retry = await runAttempt(await createFreshSessionPath(), entry);
+      return toResult(retry, entry.model, true);
     }
 
-    return toResult(initial);
+    return toResult(initial, entry.model);
+  };
+
+  try {
+    return await executeWithOptionalModelChain({
+      config,
+      sessionId: canResumeSession ? sessionPath : null,
+      onLog,
+      isRateLimited: (result) =>
+        result.errorFamily === "transient_upstream"
+        || isPiRateLimited(
+          String((result.resultJson ?? {}).stdout ?? ""),
+          String((result.resultJson ?? {}).stderr ?? ""),
+          result.errorMessage,
+        ),
+      executeEntry: async (entry, chainSessionPath) => runEntry(entry, chainSessionPath),
+    });
   } finally {
     await Promise.all([
       paperclipBridge?.stop(),

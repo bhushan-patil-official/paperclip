@@ -2,7 +2,14 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import {
+  executeWithOptionalModelChain,
+  inferOpenAiCompatibleBiller,
+  isGenericRateLimitedText,
+  type AdapterExecutionContext,
+  type AdapterExecutionResult,
+  type ModelChainEntry,
+} from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
@@ -577,18 +584,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     heartbeatPromptChars: renderedPrompt.length,
   };
 
-  const buildArgs = (resumeSessionId: string | null) => {
+  const buildArgs = (resumeSessionId: string | null, attemptModel: string, attemptMode: string) => {
     const args = ["-p", "--output-format", "stream-json", "--workspace", effectiveExecutionCwd];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
-    if (model) args.push("--model", model);
-    if (mode) args.push("--mode", mode);
+    if (attemptModel) args.push("--model", attemptModel);
+    if (attemptMode) args.push("--mode", attemptMode);
     if (autoTrustEnabled) args.push("--yolo");
     if (extraArgs.length > 0) args.push(...extraArgs);
     return args;
   };
 
-  const runAttempt = async (resumeSessionId: string | null) => {
-    const args = buildArgs(resumeSessionId);
+  const runAttempt = async (resumeSessionId: string | null, entry: ModelChainEntry) => {
+    const attemptModel = entry.model;
+    const attemptMode = asString(entry.variant, mode);
+    const attemptEnv = entry.env ? { ...env, ...entry.env } : env;
+    const args = buildArgs(resumeSessionId, attemptModel, attemptMode);
     if (onMeta) {
       await onMeta({
         adapterType: "cursor",
@@ -629,7 +639,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       cwd,
-      env,
+      env: attemptEnv,
       timeoutSec,
       graceSec,
       stdin: prompt,
@@ -650,8 +660,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
-  const providerFromModel = resolveProviderFromModel(model);
-
   const toResult = (
     attempt: {
       proc: {
@@ -663,8 +671,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
       parsed: ReturnType<typeof parseCursorJsonl>;
     },
+    attemptModelId: string,
     clearSessionOnMissingSession = false,
   ): AdapterExecutionResult => {
+    const providerFromModel = resolveProviderFromModel(attemptModelId);
     if (attempt.proc.timedOut) {
       return {
         exitCode: attempt.proc.exitCode,
@@ -696,6 +706,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       parsedError ||
       stderrLine ||
       `Cursor exited with code ${attempt.proc.exitCode ?? -1}`;
+    const rateLimited = (attempt.proc.exitCode ?? 0) !== 0
+      && isGenericRateLimitedText(`${attempt.proc.stdout}\n${attempt.proc.stderr}\n${fallbackErrorMessage}`);
 
     return {
       exitCode: attempt.proc.exitCode,
@@ -705,13 +717,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (attempt.proc.exitCode ?? 0) === 0
           ? null
           : fallbackErrorMessage,
+      errorCode: rateLimited ? "cursor_rate_limited" : null,
+      errorFamily: rateLimited ? "transient_upstream" : null,
       usage: attempt.parsed.usage,
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,
       provider: providerFromModel,
       biller: resolveCursorBiller(effectiveEnv, billingType, providerFromModel),
-      model,
+      model: attemptModelId,
       billingType,
       costUsd: attempt.parsed.costUsd,
       resultJson: {
@@ -723,22 +737,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
-  try {
-    const initial = await runAttempt(sessionId);
+  const runEntry = async (entry: ModelChainEntry, chainSessionId: string | null): Promise<AdapterExecutionResult> => {
+    const initial = await runAttempt(chainSessionId, entry);
     if (
-      sessionId &&
+      chainSessionId &&
       !initial.proc.timedOut &&
       (initial.proc.exitCode ?? 0) !== 0 &&
       isCursorUnknownSessionError(initial.proc.stdout, initial.proc.stderr)
     ) {
       await onLog(
         "stdout",
-        `[paperclip] Cursor resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
+        `[paperclip] Cursor resume session "${chainSessionId}" is unavailable; retrying with a fresh session.\n`,
       );
-      const retry = await runAttempt(null);
-      return toResult(retry, true);
+      const retry = await runAttempt(null, entry);
+      return toResult(retry, entry.model, true);
     }
-    return toResult(initial);
+    return toResult(initial, entry.model);
+  };
+
+  try {
+    return await executeWithOptionalModelChain({
+      config,
+      sessionId,
+      onLog,
+      executeEntry: async (entry, chainSessionId) => runEntry(entry, chainSessionId),
+    });
   } finally {
     if (paperclipBridge) {
       await paperclipBridge.stop();

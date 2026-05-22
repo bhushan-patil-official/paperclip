@@ -88,6 +88,18 @@ export function parseOpenCodeJsonl(stdout: string) {
   };
 }
 
+const OPENCODE_RATE_LIMIT_RE =
+  /(?:FreeUsageLimitError|maxRetriesExceeded|rate[-\s]?limit(?:ed)?|too\s+many\s+requests|\b429\b|resource_exhausted|quota\s+exceeded)/i;
+
+export function isOpenCodeRateLimited(
+  stdout: string,
+  stderr: string,
+  errorMessage?: string | null,
+): boolean {
+  const haystack = [stdout, stderr, errorMessage ?? ""].join("\n");
+  return OPENCODE_RATE_LIMIT_RE.test(haystack);
+}
+
 export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): boolean {
   const haystack = `${stdout}\n${stderr}`
     .split(/\r?\n/)

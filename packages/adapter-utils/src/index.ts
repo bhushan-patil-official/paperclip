@@ -62,6 +62,20 @@ export {
 } from "./command-redaction.js";
 export { buildSandboxNpmInstallCommand } from "./sandbox-install-command.js";
 export { inferOpenAiCompatibleBiller } from "./billing.js";
+export type { ModelChainEntry } from "./model-chain.js";
+export {
+  applyModelChainExhaustionToResult,
+  executeWithOptionalModelChain,
+  GENERIC_RATE_LIMIT_RE,
+  isAdapterResultRateLimited,
+  isGenericRateLimitedText,
+  mergeChainEntryIntoConfig,
+  MODEL_CHAIN_EXHAUSTED_ERROR_CODE,
+  MODEL_CHAIN_EXHAUSTED_MESSAGE,
+  parseModelChainFromConfig,
+  resolveEffectiveModelChain,
+  runWithModelFallbackChain,
+} from "./model-chain.js";
 // Keep the root adapter-utils entry browser-safe because the UI imports it.
 // The sandbox callback bridge stays available via its dedicated subpath export.
 export type {

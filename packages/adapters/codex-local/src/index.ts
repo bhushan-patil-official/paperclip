@@ -57,6 +57,30 @@ export const modelProfiles: AdapterModelProfileDefinition[] = [
     },
     source: "adapter_default",
   },
+  {
+    key: "simple",
+    label: "Simple",
+    adapterConfig: { model: "gpt-5.3-codex-spark", modelReasoningEffort: "low" },
+    source: "adapter_default",
+  },
+  {
+    key: "standard",
+    label: "Standard",
+    adapterConfig: { model: DEFAULT_CODEX_LOCAL_MODEL },
+    source: "adapter_default",
+  },
+  {
+    key: "advanced",
+    label: "Advanced",
+    adapterConfig: { model: "gpt-5.4", modelReasoningEffort: "high" },
+    source: "adapter_default",
+  },
+  {
+    key: "expert",
+    label: "Expert",
+    adapterConfig: { model: "gpt-5.4", modelReasoningEffort: "xhigh" },
+    source: "adapter_default",
+  },
 ];
 
 export const agentConfigurationDoc = `# codex_local agent configuration

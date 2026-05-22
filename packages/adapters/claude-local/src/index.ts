@@ -25,6 +25,34 @@ export const modelProfiles: AdapterModelProfileDefinition[] = [
     },
     source: "adapter_default",
   },
+  {
+    key: "simple",
+    label: "Simple",
+    description: "Routine, low-complexity tasks.",
+    adapterConfig: { model: "claude-haiku-4-5", effort: "low" },
+    source: "adapter_default",
+  },
+  {
+    key: "standard",
+    label: "Standard",
+    description: "Default medium-complexity work.",
+    adapterConfig: { model: "claude-sonnet-4-5" },
+    source: "adapter_default",
+  },
+  {
+    key: "advanced",
+    label: "Advanced",
+    description: "High-complexity implementation and review.",
+    adapterConfig: { model: "claude-sonnet-4-6" },
+    source: "adapter_default",
+  },
+  {
+    key: "expert",
+    label: "Expert",
+    description: "Maximum capability for urgent or critical work.",
+    adapterConfig: { model: "claude-opus-4-7", effort: "high" },
+    source: "adapter_default",
+  },
 ];
 
 export const agentConfigurationDoc = `# claude_local agent configuration

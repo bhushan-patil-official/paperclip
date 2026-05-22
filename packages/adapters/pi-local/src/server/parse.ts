@@ -217,6 +217,14 @@ export function parsePiJsonl(stdout: string): ParsedPiOutput {
   return result;
 }
 
+const PI_RATE_LIMIT_RE =
+  /(?:RESOURCE_EXHAUSTED|rate[-\s]?limit(?:ed)?|too\s+many\s+requests|\b429\b|quota\s+exceeded)/i;
+
+export function isPiRateLimited(stdout: string, stderr: string, errorMessage?: string | null): boolean {
+  const haystack = [stdout, stderr, errorMessage ?? ""].join("\n");
+  return PI_RATE_LIMIT_RE.test(haystack);
+}
+
 export function isPiUnknownSessionError(stdout: string, stderr: string): boolean {
   const haystack = `${stdout}\n${stderr}`
     .split(/\r?\n/)

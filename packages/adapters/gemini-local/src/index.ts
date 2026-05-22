@@ -29,6 +29,30 @@ export const modelProfiles: AdapterModelProfileDefinition[] = [
     },
     source: "adapter_default",
   },
+  {
+    key: "simple",
+    label: "Simple",
+    adapterConfig: { model: "gemini-2.5-flash-lite" },
+    source: "adapter_default",
+  },
+  {
+    key: "standard",
+    label: "Standard",
+    adapterConfig: { model: DEFAULT_GEMINI_LOCAL_MODEL },
+    source: "adapter_default",
+  },
+  {
+    key: "advanced",
+    label: "Advanced",
+    adapterConfig: { model: "gemini-2.5-pro" },
+    source: "adapter_default",
+  },
+  {
+    key: "expert",
+    label: "Expert",
+    adapterConfig: { model: "gemini-2.5-pro" },
+    source: "adapter_default",
+  },
 ];
 
 export const agentConfigurationDoc = `# gemini_local agent configuration

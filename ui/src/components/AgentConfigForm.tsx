@@ -7,7 +7,13 @@ import type {
   EnvBinding,
   Environment,
 } from "@paperclipai/shared";
-import { AGENT_DEFAULT_MAX_CONCURRENT_RUNS, supportedEnvironmentDriversForAdapter } from "@paperclipai/shared";
+import {
+  AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
+  ISSUE_PRIORITIES,
+  type IssuePriority,
+  type ModelProfileKey,
+  supportedEnvironmentDriversForAdapter,
+} from "@paperclipai/shared";
 import type { AdapterModel } from "../api/agents";
 import { agentsApi } from "../api/agents";
 import { environmentsApi } from "../api/environments";
@@ -115,14 +121,43 @@ const emptyOverlay: AgentConfigOverlay = {
 const EMPTY_ENV: Record<string, EnvBinding> = {};
 
 function isOverlayDirty(o: AgentConfigOverlay): boolean {
+  const hasTierProfiles = o.modelProfiles
+    ? Object.values(o.modelProfiles).some((profile) => profile !== undefined)
+    : false;
   return (
     Object.keys(o.identity).length > 0 ||
     o.adapterType !== undefined ||
     Object.keys(o.adapterConfig).length > 0 ||
     Object.keys(o.heartbeat).length > 0 ||
     Object.keys(o.runtime).length > 0 ||
-    o.modelProfiles?.cheap !== undefined
+    hasTierProfiles ||
+    o.modelTierRules !== undefined
   );
+}
+
+type ModelChainRow = {
+  model: string;
+  variant?: string;
+};
+
+const TIER_PROFILE_KEYS: ModelProfileKey[] = ["simple", "standard", "advanced", "expert"];
+
+function readModelChainRows(config: Record<string, unknown>): ModelChainRow[] {
+  const rawChain = config.modelChain;
+  if (!Array.isArray(rawChain)) return [];
+  const rows: ModelChainRow[] = [];
+  for (const entry of rawChain) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
+    const record = entry as Record<string, unknown>;
+    const model = typeof record.model === "string" ? record.model.trim() : "";
+    if (!model) continue;
+    const variant = typeof record.variant === "string" ? record.variant.trim() : "";
+    rows.push({
+      model,
+      ...(variant ? { variant } : {}),
+    });
+  }
+  return rows;
 }
 
 /* ---- Shared input class ---- */
@@ -419,6 +454,10 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   // Popover states
   const [modelOpen, setModelOpen] = useState(false);
   const [cheapModelOpen, setCheapModelOpen] = useState(false);
+  const [chainModelOpenIndex, setChainModelOpenIndex] = useState<number | null>(null);
+  const [tierModelOpenKey, setTierModelOpenKey] = useState<ModelProfileKey | null>(null);
+  const [fallbackChainOpen, setFallbackChainOpen] = useState(false);
+  const [modelTiersOpen, setModelTiersOpen] = useState(false);
   const [thinkingEffortOpen, setThinkingEffortOpen] = useState(false);
 
   // Cheap model profile state — only relevant when the adapter advertises
@@ -426,7 +465,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   // /model-profiles endpoint so the UI does not encode adapter-specific
   // cheap defaults.
   const supportsModelProfiles = adapterCaps.supportsModelProfiles;
-  const { data: adapterCheapProfileDefinitions } = useQuery({
+  const { data: adapterModelProfileDefinitions } = useQuery({
     queryKey: selectedCompanyId
       ? queryKeys.agents.adapterModelProfiles(selectedCompanyId, adapterType)
       : ["agents", "none", "adapter-model-profiles", adapterType],
@@ -434,8 +473,19 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     enabled: Boolean(selectedCompanyId) && supportsModelProfiles,
   });
   const adapterCheapDefault = useMemo(() => {
-    return (adapterCheapProfileDefinitions ?? []).find((profile) => profile.key === "cheap") ?? null;
-  }, [adapterCheapProfileDefinitions]);
+    return (adapterModelProfileDefinitions ?? []).find((profile) => profile.key === "cheap") ?? null;
+  }, [adapterModelProfileDefinitions]);
+  const adapterTierDefaults = useMemo(() => {
+    const defaults: Partial<Record<ModelProfileKey, string>> = {};
+    for (const profile of adapterModelProfileDefinitions ?? []) {
+      if (!TIER_PROFILE_KEYS.includes(profile.key as ModelProfileKey)) continue;
+      const profileModel = (profile.adapterConfig as Record<string, unknown>).model;
+      if (typeof profileModel === "string" && profileModel.trim()) {
+        defaults[profile.key as ModelProfileKey] = profileModel;
+      }
+    }
+    return defaults;
+  }, [adapterModelProfileDefinitions]);
   const adapterCheapDefaultModel = useMemo(() => {
     const adapterConfig = adapterCheapDefault?.adapterConfig ?? {};
     const value = (adapterConfig as Record<string, unknown>).model;
@@ -641,6 +691,163 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
         },
       };
     });
+  }
+
+  const effectiveAdapterConfig = useMemo(() => {
+    if (isCreate) {
+      return uiAdapter.buildAdapterConfig(val!);
+    }
+    return { ...(config as Record<string, unknown>), ...overlay.adapterConfig };
+  }, [isCreate, uiAdapter, val, config, overlay.adapterConfig]);
+
+  const currentModelChainRows = useMemo(
+    () => readModelChainRows(effectiveAdapterConfig),
+    [effectiveAdapterConfig],
+  );
+
+  function setModelChainRows(nextRows: ModelChainRow[]) {
+    const serialized = nextRows
+      .filter((row) => row.model.trim().length > 0)
+      .map((row) => ({
+        model: row.model.trim(),
+        ...(row.variant?.trim() ? { variant: row.variant.trim() } : {}),
+      }));
+    mark("adapterConfig", "modelChain", serialized.length > 0 ? serialized : undefined);
+  }
+
+  const tierProfileFromAgent = useMemo(() => {
+    const profiles = (runtimeConfig.modelProfiles ?? {}) as Record<string, unknown>;
+    const readTier = (key: ModelProfileKey) => {
+      const tier = (profiles[key] ?? {}) as Record<string, unknown>;
+      const tierAdapterConfig = (tier.adapterConfig ?? {}) as Record<string, unknown>;
+      return typeof tierAdapterConfig.model === "string" ? tierAdapterConfig.model : "";
+    };
+    return Object.fromEntries(TIER_PROFILE_KEYS.map((key) => [key, readTier(key)])) as Record<
+      ModelProfileKey,
+      string
+    >;
+  }, [runtimeConfig]);
+
+  const currentTierModels = useMemo(() => {
+    return Object.fromEntries(
+      TIER_PROFILE_KEYS.map((key) => {
+        const overlayTier = overlay.modelProfiles?.[key];
+        const overlayModel = (overlayTier?.adapterConfig as Record<string, unknown> | undefined)?.model;
+        if (typeof overlayModel === "string") return [key, overlayModel];
+        return [key, tierProfileFromAgent[key] ?? ""];
+      }),
+    ) as Record<ModelProfileKey, string>;
+  }, [overlay.modelProfiles, tierProfileFromAgent]);
+
+  function setTierModel(tierKey: ModelProfileKey, nextModel: string) {
+    if (isCreate) return;
+    setOverlay((prev) => ({
+      ...prev,
+      modelProfiles: {
+        ...prev.modelProfiles,
+        [tierKey]: {
+          ...(prev.modelProfiles?.[tierKey] ?? {}),
+          adapterConfig: {
+            ...((prev.modelProfiles?.[tierKey]?.adapterConfig ?? {}) as Record<string, unknown>),
+            model: nextModel || undefined,
+          },
+        },
+      },
+    }));
+  }
+
+  const tierRulesFromAgent = useMemo(() => {
+    const rules = (runtimeConfig.modelTierRules ?? {}) as Record<string, unknown>;
+    const priority = (rules.priority ?? {}) as Record<string, unknown>;
+    const priorityMap = Object.fromEntries(
+      ISSUE_PRIORITIES.map((priorityKey) => [
+        priorityKey,
+        typeof priority[priorityKey] === "string" ? (priority[priorityKey] as ModelProfileKey) : null,
+      ]),
+    ) as Record<IssuePriority, ModelProfileKey | null>;
+    const defaultTier = typeof rules.default === "string" ? (rules.default as ModelProfileKey) : null;
+    return { priorityMap, defaultTier, configured: Object.keys(rules).length > 0 };
+  }, [runtimeConfig]);
+
+  const currentAutoRouteEnabled = isCreate
+    ? false
+    : overlay.modelTierRules?.cleared
+      ? false
+      : overlay.modelTierRules !== undefined || tierRulesFromAgent.configured;
+
+  const currentPriorityTierMap = useMemo(() => {
+    if (isCreate) {
+      return Object.fromEntries(ISSUE_PRIORITIES.map((priorityKey) => [priorityKey, null])) as Record<
+        IssuePriority,
+        ModelProfileKey | null
+      >;
+    }
+    const overlayPriority = overlay.modelTierRules?.priority;
+    return Object.fromEntries(
+      ISSUE_PRIORITIES.map((priorityKey) => {
+        if (overlayPriority && priorityKey in overlayPriority) {
+          return [priorityKey, overlayPriority[priorityKey] ?? null];
+        }
+        return [priorityKey, tierRulesFromAgent.priorityMap[priorityKey]];
+      }),
+    ) as Record<IssuePriority, ModelProfileKey | null>;
+  }, [isCreate, overlay.modelTierRules?.priority, tierRulesFromAgent.priorityMap]);
+
+  const currentDefaultTier = isCreate
+    ? null
+    : overlay.modelTierRules?.default !== undefined
+      ? overlay.modelTierRules.default
+      : tierRulesFromAgent.defaultTier;
+
+  function setAutoRouteEnabled(enabled: boolean) {
+    if (isCreate) return;
+    if (!enabled) {
+      setOverlay((prev) => ({
+        ...prev,
+        modelTierRules: { cleared: true },
+      }));
+      return;
+    }
+    setOverlay((prev) => ({
+      ...prev,
+      modelTierRules: {
+        cleared: false,
+        priority: {
+          low: "simple",
+          medium: "standard",
+          high: "advanced",
+          critical: "expert",
+        },
+        default: "standard",
+      },
+    }));
+  }
+
+  function setPriorityTierMapping(priorityKey: IssuePriority, tierKey: ModelProfileKey | null) {
+    if (isCreate) return;
+    setOverlay((prev) => ({
+      ...prev,
+      modelTierRules: {
+        ...(prev.modelTierRules ?? {}),
+        cleared: false,
+        priority: {
+          ...(prev.modelTierRules?.priority ?? tierRulesFromAgent.priorityMap),
+          [priorityKey]: tierKey,
+        },
+      },
+    }));
+  }
+
+  function setDefaultTier(tierKey: ModelProfileKey | null) {
+    if (isCreate) return;
+    setOverlay((prev) => ({
+      ...prev,
+      modelTierRules: {
+        ...(prev.modelTierRules ?? {}),
+        cleared: false,
+        default: tierKey,
+      },
+    }));
   }
 
   const effectiveRuntimeConfig = useMemo(() => {
@@ -1041,6 +1248,40 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                   onModelChange={setCheapModel}
                   open={cheapModelOpen}
                   onOpenChange={setCheapModelOpen}
+                />
+              )}
+
+              {supportsModelProfiles && !isCreate && (
+                <ProviderFallbackChainSection
+                  rows={currentModelChainRows}
+                  models={models}
+                  adapterType={adapterType}
+                  primaryModel={currentModelId}
+                  open={fallbackChainOpen}
+                  onOpenChange={setFallbackChainOpen}
+                  chainModelOpenIndex={chainModelOpenIndex}
+                  onChainModelOpenIndexChange={setChainModelOpenIndex}
+                  onRowsChange={setModelChainRows}
+                />
+              )}
+
+              {supportsModelProfiles && !isCreate && (
+                <ModelTiersSection
+                  tierModels={currentTierModels}
+                  models={models}
+                  adapterType={adapterType}
+                  adapterTierDefaults={adapterTierDefaults}
+                  autoRouteEnabled={currentAutoRouteEnabled}
+                  priorityTierMap={currentPriorityTierMap}
+                  defaultTier={currentDefaultTier}
+                  open={modelTiersOpen}
+                  onOpenChange={setModelTiersOpen}
+                  tierModelOpenKey={tierModelOpenKey}
+                  onTierModelOpenKeyChange={setTierModelOpenKey}
+                  onTierModelChange={setTierModel}
+                  onAutoRouteEnabledChange={setAutoRouteEnabled}
+                  onPriorityTierChange={setPriorityTierMapping}
+                  onDefaultTierChange={setDefaultTier}
                 />
               )}
 
@@ -1723,6 +1964,219 @@ function ModelDropdown({
         </PopoverContent>
       </Popover>
     </Field>
+  );
+}
+
+function ProviderFallbackChainSection({
+  rows,
+  models,
+  adapterType,
+  primaryModel,
+  open,
+  onOpenChange,
+  chainModelOpenIndex,
+  onChainModelOpenIndexChange,
+  onRowsChange,
+}: {
+  rows: ModelChainRow[];
+  models: AdapterModel[];
+  adapterType: string;
+  primaryModel: string;
+  open: boolean;
+  onOpenChange: (next: boolean) => void;
+  chainModelOpenIndex: number | null;
+  onChainModelOpenIndexChange: (index: number | null) => void;
+  onRowsChange: (rows: ModelChainRow[]) => void;
+}) {
+  return (
+    <CollapsibleSection
+      title="Provider fallback chain"
+      open={open}
+      onToggle={() => onOpenChange(!open)}
+      bordered
+    >
+      <div className="space-y-3">
+        <p className="text-xs text-muted-foreground">
+          When the primary model is rate-limited, Paperclip tries fallback models in order. Primary:{" "}
+          <code>{primaryModel || "(not set)"}</code>.
+        </p>
+        {rows.map((row, index) => (
+          <div key={`chain-${index}`} className="flex items-start gap-2">
+            <span className="text-xs text-muted-foreground pt-2 w-16 shrink-0">Fallback {index + 1}</span>
+            <div className="flex-1 min-w-0">
+              <ModelDropdown
+                models={models}
+                value={row.model}
+                onChange={(nextModel) => {
+                  const nextRows = [...rows];
+                  nextRows[index] = { ...row, model: nextModel };
+                  onRowsChange(nextRows);
+                }}
+                open={chainModelOpenIndex === index}
+                onOpenChange={(isOpen) => onChainModelOpenIndexChange(isOpen ? index : null)}
+                allowDefault={false}
+                required={false}
+                groupByProvider={adapterType === "opencode_local"}
+                creatable
+                detectedModel={null}
+                detectedModelCandidates={[]}
+                emptyDetectHint="Choose a fallback model"
+                defaultLabel="Select fallback model"
+              />
+            </div>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="shrink-0"
+              onClick={() => onRowsChange(rows.filter((_, rowIndex) => rowIndex !== index))}
+              aria-label={`Remove fallback ${index + 1}`}
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+        ))}
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => onRowsChange([...rows, { model: "" }])}
+        >
+          Add fallback model
+        </Button>
+      </div>
+    </CollapsibleSection>
+  );
+}
+
+const TIER_LABELS: Record<ModelProfileKey, string> = {
+  cheap: "Cheap",
+  simple: "Simple",
+  standard: "Standard",
+  advanced: "Advanced",
+  expert: "Expert",
+};
+
+function ModelTiersSection({
+  tierModels,
+  models,
+  adapterType,
+  adapterTierDefaults,
+  autoRouteEnabled,
+  priorityTierMap,
+  defaultTier,
+  open,
+  onOpenChange,
+  tierModelOpenKey,
+  onTierModelOpenKeyChange,
+  onTierModelChange,
+  onAutoRouteEnabledChange,
+  onPriorityTierChange,
+  onDefaultTierChange,
+}: {
+  tierModels: Record<ModelProfileKey, string>;
+  models: AdapterModel[];
+  adapterType: string;
+  adapterTierDefaults: Partial<Record<ModelProfileKey, string>>;
+  autoRouteEnabled: boolean;
+  priorityTierMap: Record<IssuePriority, ModelProfileKey | null>;
+  defaultTier: ModelProfileKey | null;
+  open: boolean;
+  onOpenChange: (next: boolean) => void;
+  tierModelOpenKey: ModelProfileKey | null;
+  onTierModelOpenKeyChange: (key: ModelProfileKey | null) => void;
+  onTierModelChange: (tierKey: ModelProfileKey, model: string) => void;
+  onAutoRouteEnabledChange: (enabled: boolean) => void;
+  onPriorityTierChange: (priority: IssuePriority, tier: ModelProfileKey | null) => void;
+  onDefaultTierChange: (tier: ModelProfileKey | null) => void;
+}) {
+  return (
+    <CollapsibleSection
+      title="Model tiers"
+      open={open}
+      onToggle={() => onOpenChange(!open)}
+      bordered
+    >
+      <div className="space-y-4">
+        {TIER_PROFILE_KEYS.map((tierKey) => {
+          const placeholder = adapterTierDefaults[tierKey]
+            ? `Adapter default · ${adapterTierDefaults[tierKey]}`
+            : "Select model";
+          return (
+            <div key={tierKey} className="grid grid-cols-[88px_1fr] gap-2 items-center">
+              <span className="text-xs text-muted-foreground">{TIER_LABELS[tierKey]}</span>
+              <ModelDropdown
+                models={models}
+                value={tierModels[tierKey]}
+                onChange={(next) => onTierModelChange(tierKey, next)}
+                open={tierModelOpenKey === tierKey}
+                onOpenChange={(isOpen) => onTierModelOpenKeyChange(isOpen ? tierKey : null)}
+                allowDefault
+                required={false}
+                groupByProvider={adapterType === "opencode_local"}
+                creatable
+                detectedModel={null}
+                detectedModelCandidates={[]}
+                emptyDetectHint={placeholder}
+                defaultLabel={placeholder}
+              />
+            </div>
+          );
+        })}
+
+        <div className="flex items-center justify-between gap-3 border-t border-border/60 pt-3">
+          <div>
+            <div className="text-sm">Auto-route by issue priority</div>
+            <p className="text-xs text-muted-foreground">
+              When no explicit profile override is set, dispatch picks a tier from the issue priority.
+            </p>
+          </div>
+          <ToggleSwitch checked={autoRouteEnabled} onCheckedChange={onAutoRouteEnabledChange} />
+        </div>
+
+        {autoRouteEnabled ? (
+          <div className="space-y-2 rounded-md border border-border/70 bg-muted/20 p-3">
+            {ISSUE_PRIORITIES.map((priorityKey) => (
+              <div key={priorityKey} className="grid grid-cols-[88px_1fr] gap-2 items-center">
+                <span className="text-xs capitalize text-muted-foreground">{priorityKey}</span>
+                <select
+                  className={inputClass}
+                  value={priorityTierMap[priorityKey] ?? ""}
+                  onChange={(event) =>
+                    onPriorityTierChange(
+                      priorityKey,
+                      event.target.value ? (event.target.value as ModelProfileKey) : null,
+                    )}
+                >
+                  <option value="">—</option>
+                  {TIER_PROFILE_KEYS.map((tierKey) => (
+                    <option key={`${priorityKey}-${tierKey}`} value={tierKey}>
+                      {TIER_LABELS[tierKey]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ))}
+            <div className="grid grid-cols-[88px_1fr] gap-2 items-center">
+              <span className="text-xs text-muted-foreground">Default</span>
+              <select
+                className={inputClass}
+                value={defaultTier ?? ""}
+                onChange={(event) =>
+                  onDefaultTierChange(event.target.value ? (event.target.value as ModelProfileKey) : null)}
+              >
+                <option value="">—</option>
+                {TIER_PROFILE_KEYS.map((tierKey) => (
+                  <option key={`default-${tierKey}`} value={tierKey}>
+                    {TIER_LABELS[tierKey]}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </CollapsibleSection>
   );
 }
 

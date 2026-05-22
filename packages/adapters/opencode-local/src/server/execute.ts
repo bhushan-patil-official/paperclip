@@ -2,7 +2,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import {
+  executeWithOptionalModelChain,
+  inferOpenAiCompatibleBiller,
+  type AdapterExecutionContext,
+  type AdapterExecutionResult,
+  type ModelChainEntry,
+} from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
@@ -44,7 +50,7 @@ import {
   readPaperclipIssueWorkModeFromContext,
   resolvePaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
-import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
+import { isOpenCodeRateLimited, isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   parseOpenCodeModelsOutput,
@@ -548,17 +554,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       heartbeatPromptChars: renderedPrompt.length,
     };
 
-    const buildArgs = (resumeSessionId: string | null) => {
+    const buildArgs = (resumeSessionId: string | null, attemptModel: string, attemptVariant: string) => {
       const args = ["run", "--format", "json"];
       if (resumeSessionId) args.push("--session", resumeSessionId);
-      if (model) args.push("--model", model);
-      if (variant) args.push("--variant", variant);
+      if (attemptModel) args.push("--model", attemptModel);
+      if (attemptVariant) args.push("--variant", attemptVariant);
       if (extraArgs.length > 0) args.push(...extraArgs);
       return args;
     };
 
-    const runAttempt = async (resumeSessionId: string | null) => {
-      const args = buildArgs(resumeSessionId);
+    const runAttempt = async (resumeSessionId: string | null, entry: ModelChainEntry) => {
+      const attemptModel = entry.model;
+      const attemptVariant = entry.variant ?? variant;
+      const attemptEnv = entry.env
+        ? { ...preparedRuntimeConfig.env, ...entry.env }
+        : preparedRuntimeConfig.env;
+      const args = buildArgs(resumeSessionId, attemptModel, attemptVariant);
       if (onMeta) {
         await onMeta({
           adapterType: "opencode_local",
@@ -575,12 +586,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
         cwd,
-        env: preparedRuntimeConfig.env,
+        env: attemptEnv,
         stdin: prompt,
         timeoutSec,
         graceSec,
         onSpawn,
         onLog,
+        terminalResultCleanup: {
+          graceMs: 2000,
+          hasTerminalResult: ({ stdout, stderr }) =>
+            isOpenCodeRateLimited(stdout, stderr),
+        },
       });
       return {
         proc,
@@ -595,6 +611,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         rawStderr: string;
         parsed: ReturnType<typeof parseOpenCodeJsonl>;
       },
+      attemptModelId: string,
       clearSessionOnMissingSession = false,
     ): AdapterExecutionResult => {
       if (attempt.proc.timedOut) {
@@ -633,13 +650,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         parsedError ||
         stderrLine ||
         `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
-      const modelId = model || null;
+      const modelId = attemptModelId || null;
+      const rateLimited = (synthesizedExitCode ?? 0) !== 0
+        && isOpenCodeRateLimited(
+          attempt.proc.stdout,
+          attempt.proc.stderr,
+          fallbackErrorMessage,
+        );
 
       return {
         exitCode: synthesizedExitCode,
         signal: attempt.proc.signal,
         timedOut: false,
         errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+        errorCode: rateLimited ? "opencode_rate_limited" : null,
+        errorFamily: rateLimited ? "transient_upstream" : null,
         usage: {
           inputTokens: attempt.parsed.usage.inputTokens,
           outputTokens: attempt.parsed.usage.outputTokens,
@@ -662,24 +687,40 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     };
 
-    try {
-      const initial = await runAttempt(sessionId);
+    const runEntry = async (entry: ModelChainEntry, chainSessionId: string | null): Promise<AdapterExecutionResult> => {
+      const initial = await runAttempt(chainSessionId, entry);
       const initialFailed =
         !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || Boolean(initial.parsed.errorMessage));
       if (
-        sessionId &&
+        chainSessionId &&
         initialFailed &&
         isOpenCodeUnknownSessionError(initial.proc.stdout, initial.rawStderr)
       ) {
         await onLog(
           "stdout",
-          `[paperclip] OpenCode session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
+          `[paperclip] OpenCode session "${chainSessionId}" is unavailable; retrying with a fresh session.\n`,
         );
-        const retry = await runAttempt(null);
-        return toResult(retry, true);
+        const retry = await runAttempt(null, entry);
+        return toResult(retry, entry.model, true);
       }
 
-      return toResult(initial);
+      return toResult(initial, entry.model);
+    };
+
+    try {
+      return await executeWithOptionalModelChain({
+        config,
+        sessionId,
+        onLog,
+        isRateLimited: (result) =>
+          result.errorFamily === "transient_upstream"
+          || isOpenCodeRateLimited(
+            String((result.resultJson ?? {}).stdout ?? ""),
+            String((result.resultJson ?? {}).stderr ?? ""),
+            result.errorMessage,
+          ),
+        executeEntry: async (entry, chainSessionId) => runEntry(entry, chainSessionId),
+      });
     } finally {
       await Promise.all([
         paperclipBridge?.stop(),

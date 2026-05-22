@@ -3,7 +3,12 @@ import type { Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import {
+  executeWithOptionalModelChain,
+  type AdapterExecutionContext,
+  type AdapterExecutionResult,
+  type ModelChainEntry,
+} from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
@@ -51,6 +56,7 @@ import { DEFAULT_GEMINI_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js
 import {
   describeGeminiFailure,
   detectGeminiAuthRequired,
+  detectGeminiQuotaExhausted,
   isGeminiTurnLimitResult,
   isGeminiUnknownSessionError,
   parseGeminiJsonl,
@@ -503,10 +509,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     heartbeatPromptChars: renderedPrompt.length,
   };
 
-  const buildArgs = (resumeSessionId: string | null) => {
+  const buildArgs = (resumeSessionId: string | null, attemptModel: string) => {
     const args = ["--output-format", "stream-json"];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
-    if (model && model !== DEFAULT_GEMINI_LOCAL_MODEL) args.push("--model", model);
+    if (attemptModel && attemptModel !== DEFAULT_GEMINI_LOCAL_MODEL) args.push("--model", attemptModel);
     args.push("--approval-mode", "yolo");
     if (sandbox) {
       args.push("--sandbox");
@@ -518,8 +524,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     return args;
   };
 
-  const runAttempt = async (resumeSessionId: string | null) => {
-    const args = buildArgs(resumeSessionId);
+  const runAttempt = async (resumeSessionId: string | null, entry: ModelChainEntry) => {
+    const attemptModel = entry.model;
+    const attemptEnv = entry.env ? { ...env, ...entry.env } : env;
+    const args = buildArgs(resumeSessionId, attemptModel);
     if (onMeta) {
       await onMeta({
         adapterType: "gemini_local",
@@ -538,7 +546,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       cwd,
-      env,
+      env: attemptEnv,
       timeoutSec,
       graceSec,
       onSpawn,
@@ -561,6 +569,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
       parsed: ReturnType<typeof parseGeminiJsonl>;
     },
+    attemptModelId: string,
     clearSessionOnMissingSession = false,
     isRetry = false,
   ): AdapterExecutionResult => {
@@ -615,12 +624,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           : {}),
       } as Record<string, unknown>)
       : null;
+    const quotaExhausted = failed
+      && !authMeta.requiresAuth
+      && detectGeminiQuotaExhausted({
+        parsed: attempt.parsed.resultEvent,
+        stdout: attempt.proc.stdout,
+        stderr: attempt.proc.stderr,
+      }).exhausted;
     const resultJson: Record<string, unknown> = {
       ...(attempt.parsed.resultEvent ?? {
         stdout: attempt.proc.stdout,
         stderr: attempt.proc.stderr,
       }),
       ...(failed && clearSessionForTurnLimit ? { stopReason: "max_turns_exhausted" } : {}),
+      ...(quotaExhausted ? { errorFamily: "transient_upstream" } : {}),
     };
 
     return {
@@ -632,14 +649,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? "gemini_auth_required"
         : failed && clearSessionForTurnLimit
         ? "max_turns_exhausted"
+        : quotaExhausted
+        ? "gemini_quota_exhausted"
         : null,
+      errorFamily: quotaExhausted ? "transient_upstream" : null,
       usage: attempt.parsed.usage,
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,
       sessionDisplayId: resolvedSessionId,
       provider: "google",
       biller: "google",
-      model,
+      model: attemptModelId,
       billingType,
       costUsd: attempt.parsed.costUsd,
       resultJson,
@@ -649,23 +669,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
-  try {
-    const initial = await runAttempt(sessionId);
+  const runEntry = async (entry: ModelChainEntry, chainSessionId: string | null): Promise<AdapterExecutionResult> => {
+    const initial = await runAttempt(chainSessionId, entry);
     if (
-      sessionId &&
+      chainSessionId &&
       !initial.proc.timedOut &&
       (initial.proc.exitCode ?? 0) !== 0 &&
       isGeminiUnknownSessionError(initial.proc.stdout, initial.proc.stderr)
     ) {
       await onLog(
         "stdout",
-        `[paperclip] Gemini resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
+        `[paperclip] Gemini resume session "${chainSessionId}" is unavailable; retrying with a fresh session.\n`,
       );
-      const retry = await runAttempt(null);
-      return toResult(retry, true, true);
+      const retry = await runAttempt(null, entry);
+      return toResult(retry, entry.model, true, true);
     }
 
-    return toResult(initial);
+    return toResult(initial, entry.model);
+  };
+
+  try {
+    return await executeWithOptionalModelChain({
+      config,
+      sessionId,
+      onLog,
+      executeEntry: async (entry, chainSessionId) => runEntry(entry, chainSessionId),
+    });
   } finally {
     await Promise.all([
       paperclipBridge?.stop(),

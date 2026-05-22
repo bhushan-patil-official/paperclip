@@ -1,5 +1,6 @@
 import type {
   AgentAdapterType,
+  IssuePriority,
   ModelProfileKey,
   PauseReason,
   AgentRole,
@@ -20,8 +21,14 @@ export interface AgentModelProfileConfig {
   adapterConfig: Record<string, unknown>;
 }
 
+export interface AgentModelTierRules {
+  priority?: Partial<Record<IssuePriority, ModelProfileKey>>;
+  default?: ModelProfileKey;
+}
+
 export interface AgentRuntimeConfig extends Record<string, unknown> {
   modelProfiles?: Partial<Record<ModelProfileKey, AgentModelProfileConfig>>;
+  modelTierRules?: AgentModelTierRules;
 }
 
 export type AgentInstructionsBundleMode = "managed" | "external";

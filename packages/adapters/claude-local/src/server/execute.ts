@@ -1,7 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import {
+  executeWithOptionalModelChain,
+  type AdapterExecutionContext,
+  type AdapterExecutionResult,
+  type ModelChainEntry,
+} from "@paperclipai/adapter-utils";
 import type { RunProcessResult } from "@paperclipai/adapter-utils/server-utils";
 import {
   adapterExecutionTargetIsRemote,
@@ -675,6 +680,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const buildClaudeArgs = (
     resumeSessionId: string | null,
     attemptInstructionsFilePath: string | undefined,
+    attemptModel: string,
+    attemptEffort: string,
   ) => {
     const args = ["--print", "-", "--output-format", "stream-json", "--verbose"];
     if (resumeSessionId) args.push("--resume", resumeSessionId);
@@ -686,10 +693,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // For Bedrock: only pass --model when the ID is a Bedrock-native identifier
     // (e.g. "us.anthropic.*" or ARN). Anthropic-style IDs like "claude-opus-4-6" are invalid
     // on Bedrock, so skip them and let the CLI use its own configured model.
-    if (model && (!isBedrockAuth(effectiveEnv) || isBedrockModelId(model))) {
-      args.push("--model", model);
+    if (attemptModel && (!isBedrockAuth(effectiveEnv) || isBedrockModelId(attemptModel))) {
+      args.push("--model", attemptModel);
     }
-    if (effort) args.push("--effort", effort);
+    if (attemptEffort) args.push("--effort", attemptEffort);
     if (maxTurns > 0) args.push("--max-turns", String(maxTurns));
     // On resumed sessions the instructions are already in the session cache;
     // re-injecting them via --append-system-prompt-file wastes 5-10K tokens
@@ -718,9 +725,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : `Claude exited with code ${proc.exitCode ?? -1}`;
   };
 
-  const runAttempt = async (resumeSessionId: string | null) => {
+  const runAttempt = async (resumeSessionId: string | null, entry: ModelChainEntry) => {
+    const attemptModel = entry.model;
+    const attemptEffort = asString(entry.variant, effort);
+    const attemptEnv = entry.env ? { ...env, ...entry.env } : env;
     const attemptInstructionsFilePath = resumeSessionId ? undefined : effectiveInstructionsFilePath;
-    const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath);
+    const args = buildClaudeArgs(resumeSessionId, attemptInstructionsFilePath, attemptModel, attemptEffort);
     const commandNotes: string[] = [];
     if (!resumeSessionId) {
       commandNotes.push(`Using stable Claude prompt bundle ${promptBundle.bundleKey}.`);
@@ -751,7 +761,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       cwd,
-      env,
+      env: attemptEnv,
       stdin: prompt,
       timeoutSec,
       graceSec,
@@ -759,7 +769,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       onLog,
       terminalResultCleanup: {
         graceMs: terminalResultCleanupGraceMs,
-        hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
+        hasTerminalResult: ({ stdout, stderr }) =>
+          parseClaudeStreamJson(stdout).resultJson !== null
+          || isClaudeTransientUpstreamError({
+            parsed: null,
+            stdout,
+            stderr,
+            errorMessage: null,
+          }),
       },
     });
 
@@ -774,8 +791,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       parsedStream: ReturnType<typeof parseClaudeStreamJson>;
       parsed: Record<string, unknown> | null;
     },
-    opts: { fallbackSessionId: string | null; clearSessionOnMissingSession?: boolean },
+    opts: {
+      attemptModel: string;
+      fallbackSessionId: string | null;
+      clearSessionOnMissingSession?: boolean;
+    },
   ): AdapterExecutionResult => {
+    const attemptModel = opts.attemptModel;
     const { proc, parsedStream, parsed } = attempt;
     const loginMeta = detectClaudeLoginRequired({
       parsed,
@@ -932,7 +954,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionDisplayId: resolvedSessionId,
       provider: "anthropic",
       biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
-      model: parsedStream.model || asString(parsed.model, model),
+      model: parsedStream.model || asString(parsed.model, attemptModel),
       billingType,
       costUsd: parsedStream.costUsd ?? asNumber(parsed.total_cost_usd, 0),
       resultJson: mergedResultJson,
@@ -941,10 +963,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
-  try {
-    const initial = await runAttempt(sessionId ?? null);
+  const runEntry = async (entry: ModelChainEntry, chainSessionId: string | null): Promise<AdapterExecutionResult> => {
+    const initial = await runAttempt(chainSessionId, entry);
     if (
-      sessionId &&
+      chainSessionId &&
       !initial.proc.timedOut &&
       (initial.proc.exitCode ?? 0) !== 0 &&
       initial.parsed &&
@@ -952,13 +974,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ) {
       await onLog(
         "stdout",
-        `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
+        `[paperclip] Claude resume session "${chainSessionId}" is unavailable; retrying with a fresh session.\n`,
       );
-      const retry = await runAttempt(null);
-      return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+      const retry = await runAttempt(null, entry);
+      return toAdapterResult(retry, {
+        attemptModel: entry.model,
+        fallbackSessionId: null,
+        clearSessionOnMissingSession: true,
+      });
     }
 
-    return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
+    return toAdapterResult(initial, {
+      attemptModel: entry.model,
+      fallbackSessionId: runtimeSessionId || runtime.sessionId,
+    });
+  };
+
+  try {
+    return await executeWithOptionalModelChain({
+      config,
+      sessionId: sessionId ?? null,
+      onLog,
+      executeEntry: async (entry, chainSessionId) => runEntry(entry, chainSessionId),
+    });
   } finally {
     if (paperclipBridge) {
       await paperclipBridge.stop();

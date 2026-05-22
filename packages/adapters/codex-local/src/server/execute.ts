@@ -1,7 +1,14 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import {
+  executeWithOptionalModelChain,
+  inferOpenAiCompatibleBiller,
+  mergeChainEntryIntoConfig,
+  type AdapterExecutionContext,
+  type AdapterExecutionResult,
+  type ModelChainEntry,
+} from "@paperclipai/adapter-utils";
 import {
   adapterExecutionTargetIsRemote,
   adapterExecutionTargetRemoteCwd,
@@ -677,14 +684,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     heartbeatPromptChars: renderedPrompt.length,
   };
 
-  const runAttempt = async (resumeSessionId: string | null) => {
-    const execArgs = buildCodexExecArgs(
-      forceSaferInvocation ? { ...config, fastMode: false } : config,
-      {
-        resumeSessionId,
-        skipGitRepoCheck: executionTargetIsSandbox,
-      },
-    );
+  const runAttempt = async (resumeSessionId: string | null, entry: ModelChainEntry) => {
+    const baseAttemptConfig = forceSaferInvocation ? { ...config, fastMode: false } : config;
+    const attemptConfig = mergeChainEntryIntoConfig(baseAttemptConfig, entry);
+    const attemptEnv = entry.env ? { ...env, ...entry.env } : env;
+    const execArgs = buildCodexExecArgs(attemptConfig, {
+      resumeSessionId,
+      skipGitRepoCheck: executionTargetIsSandbox,
+    });
     const args = execArgs.args;
     const commandNotesWithFastMode =
       execArgs.fastModeIgnoredReason == null
@@ -709,7 +716,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       cwd,
-      env,
+      env: attemptEnv,
       stdin: prompt,
       timeoutSec,
       graceSec,
@@ -737,6 +744,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const toResult = (
     attempt: { proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string }; rawStderr: string; parsed: ReturnType<typeof parseCodexJsonl> },
+    attemptModelId: string,
     clearSessionOnMissingSession = false,
     isRetry = false,
   ): AdapterExecutionResult => {
@@ -810,7 +818,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionDisplayId: resolvedSessionId,
       provider: "openai",
       biller: resolveCodexBiller(effectiveEnv, billingType),
-      model,
+      model: attemptModelId,
       billingType,
       costUsd: null,
       resultJson: {
@@ -825,23 +833,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
-  try {
-    const initial = await runAttempt(sessionId);
+  const runEntry = async (entry: ModelChainEntry, chainSessionId: string | null): Promise<AdapterExecutionResult> => {
+    const initial = await runAttempt(chainSessionId, entry);
     if (
-      sessionId &&
+      chainSessionId &&
       !initial.proc.timedOut &&
       (initial.proc.exitCode ?? 0) !== 0 &&
       isCodexUnknownSessionError(initial.proc.stdout, initial.rawStderr)
     ) {
       await onLog(
         "stdout",
-        `[paperclip] Codex resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
+        `[paperclip] Codex resume session "${chainSessionId}" is unavailable; retrying with a fresh session.\n`,
       );
-      const retry = await runAttempt(null);
-      return toResult(retry, true, true);
+      const retry = await runAttempt(null, entry);
+      return toResult(retry, entry.model, true, true);
     }
 
-    return toResult(initial, false, false);
+    return toResult(initial, entry.model, false, false);
+  };
+
+  try {
+    return await executeWithOptionalModelChain({
+      config,
+      sessionId,
+      onLog,
+      executeEntry: async (entry, chainSessionId) => runEntry(entry, chainSessionId),
+    });
   } finally {
     if (paperclipBridge) {
       await paperclipBridge.stop();

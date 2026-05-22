@@ -7,7 +7,38 @@ export const SANDBOX_INSTALL_COMMAND = "npm install -g @earendil-works/pi-coding
 
 export const models: Array<{ id: string; label: string }> = [];
 
-export const modelProfiles: AdapterModelProfileDefinition[] = [];
+export const modelProfiles: AdapterModelProfileDefinition[] = [
+  {
+    key: "cheap",
+    label: "Cheap",
+    adapterConfig: { model: "openai/gpt-5.1-codex-mini" },
+    source: "adapter_default",
+  },
+  {
+    key: "simple",
+    label: "Simple",
+    adapterConfig: { model: "openai/gpt-5.1-codex-mini" },
+    source: "adapter_default",
+  },
+  {
+    key: "standard",
+    label: "Standard",
+    adapterConfig: { model: "anthropic/claude-sonnet-4-5" },
+    source: "adapter_default",
+  },
+  {
+    key: "advanced",
+    label: "Advanced",
+    adapterConfig: { model: "anthropic/claude-sonnet-4-5" },
+    source: "adapter_default",
+  },
+  {
+    key: "expert",
+    label: "Expert",
+    adapterConfig: { model: "anthropic/claude-opus-4-7" },
+    source: "adapter_default",
+  },
+];
 
 export const agentConfigurationDoc = `# pi_local agent configuration
 

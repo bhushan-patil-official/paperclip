@@ -72,6 +72,30 @@ export const modelProfiles: AdapterModelProfileDefinition[] = [
     },
     source: "adapter_default",
   },
+  {
+    key: "simple",
+    label: "Simple",
+    adapterConfig: { model: "openai/gpt-5.1-codex-mini", variant: "low" },
+    source: "adapter_default",
+  },
+  {
+    key: "standard",
+    label: "Standard",
+    adapterConfig: { model: DEFAULT_OPENCODE_LOCAL_MODEL },
+    source: "adapter_default",
+  },
+  {
+    key: "advanced",
+    label: "Advanced",
+    adapterConfig: { model: "openai/gpt-5.4" },
+    source: "adapter_default",
+  },
+  {
+    key: "expert",
+    label: "Expert",
+    adapterConfig: { model: "openai/gpt-5.4", variant: "high" },
+    source: "adapter_default",
+  },
 ];
 
 export const agentConfigurationDoc = `# opencode_local agent configuration

@@ -64,7 +64,7 @@ export interface AdapterRuntimeServiceReport {
   healthStatus?: "unknown" | "healthy" | "unhealthy";
 }
 
-export type AdapterExecutionErrorFamily = "transient_upstream";
+export type AdapterExecutionErrorFamily = "transient_upstream" | "rate_limited";
 
 export interface AdapterExecutionResult {
   exitCode: number | null;
@@ -145,7 +145,7 @@ export interface AdapterModel {
   label: string;
 }
 
-export type AdapterModelProfileKey = "cheap";
+export type AdapterModelProfileKey = "cheap" | "simple" | "standard" | "advanced" | "expert";
 
 export interface AdapterModelProfileDefinition {
   key: AdapterModelProfileKey;
