@@ -700,12 +700,32 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     return { ...(config as Record<string, unknown>), ...overlay.adapterConfig };
   }, [isCreate, uiAdapter, val, config, overlay.adapterConfig]);
 
-  const currentModelChainRows = useMemo(
+  // Local state for chain rows so blank new rows render immediately.
+  // Persisted rows (from adapterConfig) are the source of truth on mount / external save.
+  const persistedChainRows = useMemo(
     () => readModelChainRows(effectiveAdapterConfig),
     [effectiveAdapterConfig],
   );
+  const [localChainRows, setLocalChainRows] = useState<ModelChainRow[]>(persistedChainRows);
+
+  // When the agent is saved / overlay is reset, sync local rows back to persisted state.
+  const prevPersistedRowsRef = useRef(persistedChainRows);
+  useEffect(() => {
+    const prev = prevPersistedRowsRef.current;
+    const same =
+      prev.length === persistedChainRows.length &&
+      prev.every((r, i) => r.model === persistedChainRows[i]?.model);
+    if (!same) {
+      prevPersistedRowsRef.current = persistedChainRows;
+      setLocalChainRows(persistedChainRows);
+    }
+  }, [persistedChainRows]);
+
+  const currentModelChainRows = localChainRows;
 
   function setModelChainRows(nextRows: ModelChainRow[]) {
+    setLocalChainRows(nextRows);
+    // Only persist non-empty rows to the overlay / adapterConfig.
     const serialized = nextRows
       .filter((row) => row.model.trim().length > 0)
       .map((row) => ({
