@@ -174,10 +174,9 @@ export async function executeWithOptionalModelChain(opts: {
 }): Promise<AdapterExecutionResult> {
   const chain = resolveEffectiveModelChain(opts.config);
   if (chain.length <= 1) {
+    // When no model is configured, pass an empty-model entry so the adapter can use
+    // its CLI's built-in default (all adapters guard `if (model)` before --model flag).
     const entry = chain[0] ?? { model: readConfigString(opts.config, "model") };
-    if (!entry.model) {
-      throw new Error("adapter config.model is required");
-    }
     return opts.executeEntry(entry, opts.sessionId, 0);
   }
 
