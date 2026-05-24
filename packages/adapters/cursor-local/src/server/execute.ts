@@ -596,7 +596,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const runAttempt = async (resumeSessionId: string | null, entry: ModelChainEntry) => {
     const attemptModel = entry.model;
-    const attemptMode = asString(entry.variant, mode);
+    const attemptMode = asString(entry.variant, mode ?? "");
     const attemptEnv = entry.env ? { ...env, ...entry.env } : env;
     const args = buildArgs(resumeSessionId, attemptModel, attemptMode);
     if (onMeta) {
