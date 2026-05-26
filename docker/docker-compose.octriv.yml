@@ -1,6 +1,7 @@
 # Production-style stack: Postgres is not published; app is on host port 3000 only.
 services:
   db:
+    container_name: paperclip-db
     image: postgres:17-alpine
     environment:
       POSTGRES_USER: paperclip
@@ -16,6 +17,7 @@ services:
     restart: unless-stopped
 
   server:
+    container_name: paperclip-server
     build:
       context: ..
       dockerfile: Dockerfile

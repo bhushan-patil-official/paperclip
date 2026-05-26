@@ -65,9 +65,8 @@ export const modelProfiles: AdapterModelProfileDefinition[] = [
   {
     key: "cheap",
     label: "Cheap",
-    description: "Use OpenCode's known Codex mini model as the budget lane.",
+    description: "Run with the agent's configured model at a low-effort variant. Override adapterConfig.model in agent runtime config to use a different model for this tier.",
     adapterConfig: {
-      model: "openai/gpt-5.1-codex-mini",
       variant: "low",
     },
     source: "adapter_default",
@@ -75,25 +74,25 @@ export const modelProfiles: AdapterModelProfileDefinition[] = [
   {
     key: "simple",
     label: "Simple",
-    adapterConfig: { model: "openai/gpt-5.1-codex-mini", variant: "low" },
+    adapterConfig: { variant: "low" },
     source: "adapter_default",
   },
   {
     key: "standard",
     label: "Standard",
-    adapterConfig: { model: DEFAULT_OPENCODE_LOCAL_MODEL },
+    adapterConfig: {},
     source: "adapter_default",
   },
   {
     key: "advanced",
     label: "Advanced",
-    adapterConfig: { model: "openai/gpt-5.4" },
+    adapterConfig: { variant: "high" },
     source: "adapter_default",
   },
   {
     key: "expert",
     label: "Expert",
-    adapterConfig: { model: "openai/gpt-5.4", variant: "high" },
+    adapterConfig: { variant: "xhigh" },
     source: "adapter_default",
   },
 ];
