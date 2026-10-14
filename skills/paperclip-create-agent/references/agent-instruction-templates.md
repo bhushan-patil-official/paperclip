@@ -9,6 +9,9 @@ responsibility that fits the requested hire; a matching template is not required
 | [QA](agents/qa.md) | Product verification and reproducible findings |
 | [UX Designer](agents/uxdesigner.md) | User experience, interaction design, accessibility, and design-system coherence |
 | [Security Engineer](agents/securityengineer.md) | Security reviews, threat modeling, and remediation |
+| [Product Manager](agents/pm.md) | Turns specs into numbered acceptance criteria and one batched round of questions |
+| [CTO](agents/cto.md) | Full-rigor technical leadership |
+| [CTO (Tiered)](agents/cto-tiered.md) | Light path for routine work, full risk analysis only for risky changes |
 
 Copy only the example's `AGENTS.md` body into the hire's managed instruction
 bundle. Replace its name and company placeholders. Adapt the responsibility
