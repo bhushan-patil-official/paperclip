@@ -356,6 +356,19 @@ describe("task watchdog subtree classifier", () => {
     expect(result).toMatchObject({ state: "live", liveIssueIds: [sourceId] });
   });
 
+  it("does not treat a deferred wake with no execution holder as live", () => {
+    const result = classify({
+      issues: [issue({ status: "in_progress" })],
+      // A deferred_issue_execution wake whose holder run was cancelled and never
+      // produced a successor: no activeRuns, no queued wake — only the orphaned
+      // deferred wake remains. This must classify as stopped so the watchdog can
+      // apply its `status -> todo` recovery instead of looping on the fingerprint.
+      queuedWakeRequests: [{ companyId, issueId: sourceId, agentId: "agent-1", status: "deferred_issue_execution" }],
+    });
+
+    expect(result.state).toBe("stopped");
+  });
+
   it("triggers a genuinely idle assigned issue once the grace window has elapsed", () => {
     const createdAt = new Date("2026-06-18T16:32:45.731Z");
     const result = classify({
