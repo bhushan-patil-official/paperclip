@@ -29,6 +29,7 @@ const basePreDrainFacts: PreDrainFacts = {
   hasAssigneeUser: false,
   assigneeAgentMatchesRunAgent: true,
   legacyExecutionNeedsReconciliation: false,
+  reassignmentStopConfirmed: false,
   executionCancellationAcknowledged: false,
 };
 
@@ -87,6 +88,24 @@ describe("decidePreDrain", () => {
       name: "released: legacy execution needs reconciliation",
       facts: { ...basePreDrainFacts, legacyExecutionNeedsReconciliation: true },
       expected: { kind: "released" },
+    },
+    {
+      name: "proceed: a confirmed reassignment stop still drains the deferred wake instead of short-circuiting into legacy reconciliation",
+      facts: {
+        ...basePreDrainFacts,
+        legacyExecutionNeedsReconciliation: true,
+        reassignmentStopConfirmed: true,
+      },
+      expected: { kind: "proceed" },
+    },
+    {
+      name: "proceed: a confirmed reassignment stop still drains the deferred wake instead of short-circuiting into acknowledged cancellation",
+      facts: {
+        ...basePreDrainFacts,
+        executionCancellationAcknowledged: true,
+        reassignmentStopConfirmed: true,
+      },
+      expected: { kind: "proceed" },
     },
     {
       name: "released: an acknowledged execution cancellation",

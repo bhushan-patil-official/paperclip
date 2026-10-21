@@ -111,6 +111,10 @@ export function isOperatorStoppedRunRow(row: Pick<HeartbeatRunRow, "status" | "e
   if (cancellation?.source === "queued_message") return false;
   if (cancellation?.source === "operator" && cancellation.expected) return true;
   if (row.errorCode && OPERATOR_STOP_ERROR_CODES.has(row.errorCode)) return true;
+  // A confirmed reassignment stop is a deliberate hand-off to the new assignee.
+  // Release must not immediately re-queue the outgoing owner; the new assignee's
+  // deferred `issue_assigned` wake is drained separately.
+  if (row.errorCode === "issue_reassigned" && parseObject(row.resultJson).reassignmentStopConfirmed === true) return true;
   const actorType = parseObject(row.resultJson).cancelledByActorType;
   return actorType === "user" || actorType === "board";
 }
@@ -1125,6 +1129,17 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           hasAssigneeUser: Boolean(issueRow?.assigneeUserId),
           assigneeAgentMatchesRunAgent: issueRow?.assigneeAgentId === run.agentId,
           legacyExecutionNeedsReconciliation: await legacyExecutionNeedsReconciliationWithEvidence(tx as unknown as Db, run),
+          // A confirmed reassignment stop is a deliberate hand-off to the new
+          // assignee, not a provider failure or an operator stop. It must still
+          // drain the new assignee's deferred `issue_assigned` wake instead of
+          // short-circuiting into the legacy-reconciliation or acknowledged-
+          // cancellation "released" paths. Native reassignment keeps its own
+          // acknowledged-handoff handling via `isAcknowledgedNativeReassignmentStop`.
+          reassignmentStopConfirmed:
+            run.status === "cancelled" &&
+            run.errorCode === "issue_reassigned" &&
+            parseObject(run.resultJson).reassignmentStopConfirmed === true &&
+            !isAcknowledgedNativeReassignmentStop(run),
           // An operator stop never promotes old queued work by itself. The
           // next explicit wake adopts those messages atomically when it
           // queues a run.

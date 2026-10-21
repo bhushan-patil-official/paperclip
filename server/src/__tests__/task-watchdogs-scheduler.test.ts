@@ -357,6 +357,36 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(watchdogIssues).toHaveLength(0);
   });
 
+  it("triggers on a deferred assignment wake whose execution holder is gone", async () => {
+    const companyId = await seedCompany();
+    const sourceId = await seedIssue(companyId, { identifier: "WDOG-DEFER", status: "in_progress" });
+    const childId = await seedIssue(companyId, { parentId: sourceId, status: "todo" });
+    const agentId = await seedAgent(companyId);
+    await seedWatchdog(companyId, sourceId, agentId);
+    // A comment-driven reassignment cancelled the holder run (issue_reassigned)
+    // and never produced a successor, leaving only this orphaned deferred wake.
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      status: "deferred_issue_execution",
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: childId },
+    });
+    const { service, wakes } = createService();
+
+    const result = await service.reconcileTaskWatchdogs({ companyId });
+
+    expect(result).toMatchObject({ checked: 1, triggered: 1 });
+    expect(wakes).toHaveLength(1);
+    const watchdogIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "task_watchdog")));
+    expect(watchdogIssues).toHaveLength(1);
+  });
+
   it("does not keep the source live for runs under a nested task-watchdog issue", async () => {
     const companyId = await seedCompany();
     const sourceId = await seedIssue(companyId, { identifier: "WDOG-NEST", status: "done" });

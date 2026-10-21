@@ -27,7 +27,13 @@ import { TASK_WATCHDOG_ORIGIN_KIND } from "./task-watchdog-scope.js";
 const TASK_WATCHDOG_STOP_FINGERPRINT_PREFIX = "task_watchdog_stop:";
 const TASK_WATCHDOG_SUBTREE_MAX_DEPTH = 100;
 const TASK_WATCHDOG_LIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
-const TASK_WATCHDOG_WAKE_REQUEST_STATUSES = ["queued", "deferred_issue_execution"] as const;
+// A `deferred_issue_execution` wake is parked behind an active execution run,
+// so it only represents a live path while that holder run is itself live (which
+// the separate `activeRuns` path above already detects). Treating a deferred
+// wake as live on its own marks an orphaned wake — whose holder run was already
+// cancelled without a successor, e.g. after a comment-driven reassignment — as
+// a live path and blocks the watchdog's documented `status -> todo` recovery.
+const TASK_WATCHDOG_WAKE_REQUEST_STATUSES = ["queued"] as const;
 const TASK_WATCHDOG_TERMINAL_ISSUE_STATUSES = ["done", "cancelled"] as const;
 const TASK_WATCHDOG_TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 // Grace window after an issue is created/assigned during which its first
@@ -408,9 +414,17 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
 
   const includedIds = included.map((issue) => issue.id);
   const includedIdSet = new Set(includedIds);
+  // Only genuinely queued wake requests constitute a live path on their own. A
+  // deferred wake is parked behind an active execution run and is captured by
+  // `activeRuns` while that holder is live; counting it independently makes an
+  // orphaned deferred wake (holder cancelled, no successor) look live and
+  // blocks the watchdog recovery path.
+  const liveWakeRequests = (input.queuedWakeRequests ?? []).filter(
+    (path) => path.status === "queued",
+  );
   const liveIssueIds = [
     ...pathIssueIds(input.activeRuns, input.watchdog.companyId),
-    ...pathIssueIds(input.queuedWakeRequests, input.watchdog.companyId),
+    ...pathIssueIds(liveWakeRequests, input.watchdog.companyId),
   ].filter((issueId) => includedIdSet.has(issueId));
   const uniqueLiveIssueIds = [...new Set(liveIssueIds)].sort();
   if (uniqueLiveIssueIds.length > 0) {
