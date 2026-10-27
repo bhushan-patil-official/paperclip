@@ -72,6 +72,8 @@ export type PreDrainFacts = {
   hasAssigneeUser: boolean;
   assigneeAgentMatchesRunAgent: boolean;
   legacyExecutionNeedsReconciliation: boolean;
+  /** True when the finishing run was deliberately stopped to hand the issue to a new assignee. */
+  reassignmentStopConfirmed: boolean;
   /** True when the finishing run is cancelled and its stored result carries an acknowledged execution cancellation. */
   executionCancellationAcknowledged: boolean;
 };
@@ -85,11 +87,13 @@ export type PreDrainDecision =
  * Decides the pre-drain release outcome for one lock acquisition, before the
  * caller runs its own lock function. Check order is fixed: the issue-row
  * check runs first, then the blocked-notice check, then legacy-execution
- * reconciliation, then acknowledged execution cancellation. Each check
- * returns as soon as it applies, so an earlier true condition can hide a
- * later one when both hold at the same time. "proceed" means none of the
- * four checks applied; the caller then runs its own write-carrying check
- * and, if that also clears, calls its lock function.
+ * reconciliation, then acknowledged execution cancellation. A confirmed
+ * reassignment stop skips both the reconciliation and acknowledged-cancellation
+ * "released" paths so the new assignee's deferred `issue_assigned` wake is
+ * still drained. Each check returns as soon as it applies, so an earlier true
+ * condition can hide a later one when both hold at the same time. "proceed"
+ * means none of the checks applied; the caller then runs its own
+ * write-carrying check and, if that also clears, calls its lock function.
  */
 export function decidePreDrain(facts: PreDrainFacts): PreDrainDecision {
   if (!facts.issueRowPresent || !facts.executionRunIdMatchesRun) {
@@ -108,11 +112,11 @@ export function decidePreDrain(facts: PreDrainFacts): PreDrainDecision {
     };
   }
 
-  if (facts.legacyExecutionNeedsReconciliation) {
+  if (facts.legacyExecutionNeedsReconciliation && !facts.reassignmentStopConfirmed) {
     return { kind: "released" };
   }
 
-  if (facts.executionCancellationAcknowledged) {
+  if (facts.executionCancellationAcknowledged && !facts.reassignmentStopConfirmed) {
     return { kind: "released" };
   }
 
