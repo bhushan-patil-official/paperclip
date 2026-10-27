@@ -5,8 +5,10 @@ import { claimedAdapterType, conversationRecoveryActionPredicate, getConversatio
 import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
-import { and, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { and, eq, gt, gte, inArray, isNull, not, or, sql } from "drizzle-orm";
 import {
+  agents,
+  agentWakeupRequests,
   chatActions,
   environmentLeases,
   heartbeatRuns,
@@ -17,6 +19,7 @@ import {
 } from "@paperclipai/db";
 import { conflict } from "../errors.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
+import { getExecutionBlocker } from "./execution-blocker.js";
 import {
   EXECUTION_RECONCILIATION_CAUSES,
   type ExecutionReconciliation,
@@ -342,6 +345,167 @@ export async function deliverReconciledExecutions(
  * This is NOT evidence that an external action succeeded or never happened.
  * The resolved record retains a dispatch hold until actual evidence clears it.
  */
+/** How long a skipped hand-off wake stays eligible to be resumed. */
+export const TRANSIENT_WAIT_RESUME_WINDOW_MS = 30 * 60 * 1000;
+
+/**
+ * A hand-off wake (`issue_assigned`) that arrives while the previous run is still
+ * releasing its environment lease is recorded as a skipped diagnostic receipt
+ * (`execution_reconciliation_required`, `executionWait.recoveryActionId` null) and
+ * nothing ever retried it, so a normal hand-off stalled until someone commented.
+ *
+ * This resumes exactly those receipts, once, after the blocker has cleared. It
+ * deliberately leaves alone: receipts tied to a recovery action (a hold a person
+ * must reconcile), every other skip reason, anything older than the window,
+ * receipts whose issue is no longer waiting on the same agent, and receipts that a
+ * later run or wake already superseded.
+ */
+export async function deliverTransientExecutionWaits(
+  db: Db,
+  wake: ReturnType<typeof import("./heartbeat.js").heartbeatService>["wakeup"],
+  now: Date = new Date(),
+) {
+  const since = new Date(now.getTime() - TRANSIENT_WAIT_RESUME_WINDOW_MS);
+  const pending = await db
+    .select()
+    .from(agentWakeupRequests)
+    .where(
+      and(
+        eq(agentWakeupRequests.status, "skipped"),
+        eq(agentWakeupRequests.reason, "execution_reconciliation_required"),
+        gte(agentWakeupRequests.createdAt, since),
+        sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' = 'execution_recovery'`,
+        sql`${agentWakeupRequests.payload}->'executionWait'->>'recoveryActionId' is null`,
+        sql`${agentWakeupRequests.payload}->'executionWait'->>'resumedAt' is null`,
+        sql`${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'wakeReason' = 'issue_assigned'`,
+      ),
+    )
+    .orderBy(agentWakeupRequests.createdAt)
+    .limit(25);
+
+  const markResolved = (id: string, state: string) =>
+    db
+      .update(agentWakeupRequests)
+      .set({
+        payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{executionWait,resumedAt}', to_jsonb(${now.toISOString()}::text)) || ${JSON.stringify({ transientWaitResume: state })}::jsonb`,
+      })
+      .where(eq(agentWakeupRequests.id, id));
+
+  for (const receipt of pending) {
+    try {
+      const issueId = typeof receipt.payload?.issueId === "string" ? receipt.payload.issueId : null;
+      if (!issueId) continue;
+      const [task] = await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.companyId, receipt.companyId), eq(issues.id, issueId)));
+      if (
+        !task ||
+        task.hiddenAt ||
+        task.assigneeAgentId !== receipt.agentId ||
+        !["todo", "in_progress"].includes(task.status)
+      ) {
+        await markResolved(receipt.id, "invalidated");
+        continue;
+      }
+      const [agent] = await db
+        .select({ status: agents.status })
+        .from(agents)
+        .where(and(eq(agents.companyId, receipt.companyId), eq(agents.id, receipt.agentId)));
+      if (!agent || ["paused", "terminated"].includes(agent.status)) continue;
+
+      // Something already ran or is queued for this agent on this issue since the skip.
+      const [laterRun] = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, receipt.companyId),
+            eq(heartbeatRuns.agentId, receipt.agentId),
+            sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+            gt(heartbeatRuns.createdAt, receipt.createdAt),
+            not(and(eq(heartbeatRuns.status, "cancelled"), isNull(heartbeatRuns.startedAt))!),
+          ),
+        )
+        .limit(1);
+      const [laterWake] = laterRun
+        ? []
+        : await db
+            .select({ id: agentWakeupRequests.id })
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, receipt.companyId),
+                eq(agentWakeupRequests.agentId, receipt.agentId),
+                sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+                gt(agentWakeupRequests.createdAt, receipt.createdAt),
+                inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution", "completed"]),
+              ),
+            )
+            .limit(1);
+      if (laterRun || laterWake) {
+        await markResolved(receipt.id, "superseded");
+        continue;
+      }
+
+      // Still blocked (lease not released, or a recovery hold appeared): try again next sweep.
+      if (await getExecutionBlocker(db, receipt.companyId, issueId)) continue;
+
+      // Claim the receipt before waking so concurrent sweeps resume it once.
+      const claimed = await db
+        .update(agentWakeupRequests)
+        .set({
+          payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{executionWait,resumedAt}', to_jsonb(${now.toISOString()}::text))`,
+        })
+        .where(
+          and(
+            eq(agentWakeupRequests.id, receipt.id),
+            sql`${agentWakeupRequests.payload}->'executionWait'->>'resumedAt' is null`,
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id });
+      if (claimed.length === 0) continue;
+
+      try {
+        const run = await wake(receipt.agentId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          idempotencyKey: `transient-wait-resume:${receipt.id}`,
+          payload: { issueId, mutation: "update", resumedFromWakeRequestId: receipt.id },
+          requestedByActorType: "system",
+          requestedByActorId: "execution-wait-resume",
+          contextSnapshot: {
+            issueId,
+            taskId: issueId,
+            taskKey: issueId,
+            wakeReason: "issue_assigned",
+            wakeSource: "assignment",
+            wakeTriggerDetail: "system",
+            source: "execution.transient_wait_resumed",
+            resumedFromWakeRequestId: receipt.id,
+          },
+        });
+        await db
+          .update(agentWakeupRequests)
+          .set({
+            payload: sql`${agentWakeupRequests.payload} || ${JSON.stringify({ transientWaitResume: "resumed", transientWaitResumeRunId: run?.id ?? null })}::jsonb`,
+          })
+          .where(eq(agentWakeupRequests.id, receipt.id));
+      } catch (err) {
+        // Release the claim so the next sweep retries while the window is open.
+        await db
+          .update(agentWakeupRequests)
+          .set({ payload: sql`${agentWakeupRequests.payload} #- '{executionWait,resumedAt}'` })
+          .where(eq(agentWakeupRequests.id, receipt.id));
+        throw err;
+      }
+    } catch (err) {
+      logger.warn({ err, wakeRequestId: receipt.id }, "Transient execution wait resume remains pending");
+    }
+  }
+}
+
 export async function settleUnrecoverableExecutions(
   db: Db,
   now = new Date(),
