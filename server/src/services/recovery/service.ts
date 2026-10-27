@@ -465,7 +465,7 @@ function summarizeRunFailureForIssueComment(run: LatestIssueRun) {
   return null;
 }
 
-function didAutomaticRecoveryFail(
+export function didAutomaticRecoveryFail(
   latestRun: LatestIssueRun,
   expectedRetryReason:
     | "assignment_recovery"
@@ -473,6 +473,13 @@ function didAutomaticRecoveryFail(
     | typeof EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
 ) {
   if (!latestRun) return false;
+
+  // A recovery run that did its work and then handed the issue to the next
+  // assignee is cancelled with `issue_reassigned`. That is a deliberate
+  // hand-off, not a failed recovery. Counting it as a failure escalated
+  // healthy hand-offs to `blocked` ("No live execution path") even though
+  // the agent had finished and the next assignee was never woken.
+  if (latestRun.status === "cancelled" && latestRun.errorCode === "issue_reassigned") return false;
 
   const latestContext = parseObject(latestRun.contextSnapshot);
   const latestRetryReason = readNonEmptyString(latestContext.retryReason);
