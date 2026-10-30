@@ -56,6 +56,8 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
     if (run.runtimeMode === "legacy" && !run.processPid && !run.processGroupId &&
         (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state !== "acknowledged" &&
+        // Cancelled while building its continuation, before any adapter call: nothing ever ran.
+        run.errorCode !== "continuation_task_ownership_changed" &&
         !(run.executionStage === "settled" && !await runUsedConversationAdapter(db, run)) &&
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
   }
