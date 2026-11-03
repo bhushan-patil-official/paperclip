@@ -319,6 +319,15 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
   });
 
+  it("treats a run cancelled before its continuation was built as stopped", async () => {
+    const agent = await hire();
+    await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id,
+      status: "cancelled", invocationSource: "automation", runtimeMode: "legacy",
+      executionStage: "settled", errorCode: "continuation_task_ownership_changed",
+      startedAt: new Date(), finishedAt: new Date() });
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+  });
+
   it("does not prepare a proposed hire until approval", async () => {
     const observed: string[] = [];
     const work = worker(async agent => { observed.push(agent.lifecycleState); return "complete"; });
